@@ -6,11 +6,16 @@
       "name": "Codex Quota Scheduler (PR #12)",
       "description": "CPA v7.2.152 build integrating upstream PRs #4-#10 and per-auth in-flight request limiting with conservative session-affinity failover.",
       "author": "Jeffery / lawyer61",
-      "version": "0.2.1-pr12.1",
+      "version": "0.2.1-pr12.2",
       "repository": "https://github.com/lawyer61/cpa-plugin-codex-quota-scheduler",
-      "homepage": "https://github.com/lawyer61/cpa-plugin-codex-quota-scheduler/releases/tag/v0.2.1-pr12.1",
+      "homepage": "https://github.com/lawyer61/cpa-plugin-codex-quota-scheduler/releases/tag/v0.2.1-pr12.2",
       "license": "MIT",
-      "tags": ["Scheduler", "Management", "Codex", "PR12"]
+      "tags": [
+        "Scheduler",
+        "Management",
+        "Codex",
+        "PR12"
+      ]
     }
   ]
 }
