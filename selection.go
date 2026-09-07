@@ -133,6 +133,43 @@ func selectAccountSkipping(snapshot SchedulerSnapshot, candidates []Candidate, n
 	return SelectionResult{Reason: "no_selectable_account", Fallback: snapshot.Fallback == FallbackFillFirst}
 }
 
+func selectAccountByAuthID(snapshot SchedulerSnapshot, candidates []Candidate, authID string, now time.Time, trials *TrialRegistry) SelectionResult {
+	if authID == "" {
+		return SelectionResult{Reason: "affinity_miss"}
+	}
+	eligible := false
+	for _, candidate := range candidates {
+		if candidate.ID == authID && candidate.Provider == "codex" {
+			_, eligible = snapshot.ActiveHighestTier[candidate.ID]
+			if eligible {
+				break
+			}
+		}
+	}
+	if !eligible {
+		return SelectionResult{Reason: "affinity_auth_outside_active_tier"}
+	}
+	for _, account := range snapshot.Accounts {
+		if account.ID != authID {
+			continue
+		}
+		if trials != nil {
+			trials.Advance(account.Instance, now)
+			account.Trial = trials.State(account.Instance, now)
+		}
+		class := ClassifyAccount(account, now)
+		if class == Excluded {
+			return SelectionResult{Reason: "affinity_auth_unavailable"}
+		}
+		result := SelectionResult{AuthID: account.ID, Instance: account.Instance, Class: class, Trial: class == Opportunistic, Reason: "affinity_hit", Ordered: []AccountView{account}}
+		if result.Trial {
+			result.EvidenceSource = "trial_evidence"
+		}
+		return result
+	}
+	return SelectionResult{Reason: "affinity_auth_unknown"}
+}
+
 func accountViewLess(a, b AccountView, mode MonthlyMode) bool {
 	if a.PluginPriority != b.PluginPriority {
 		return a.PluginPriority > b.PluginPriority

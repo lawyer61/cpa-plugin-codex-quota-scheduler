@@ -7,6 +7,8 @@ provides a quota-aware, optimized Fill First scheduler for Codex accounts, so
 CPA selects accounts by real usability instead of relying on a static account
 order alone.
 
+The request-lifecycle concurrency feature requires CPA v7.2.152.
+
 ## v0.2.1 Highlights
 
 - Existing installations safely migrate their lazy-reset baselines; fresh
@@ -241,6 +243,9 @@ enable_usage_feedback: true
 enable_reset_probe: false
 probe_on_provisional_roster: false
 max_refresh_concurrency: 1
+max_inflight_requests_per_auth: 0
+session_affinity_enabled: false
+session_affinity_ttl: 1h
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5
 circuit_open_duration: 30m
@@ -255,6 +260,16 @@ log_retention: 24h
 - `priority`: prefer monthly accounts before weekly accounts within the same
   selectable class and plugin priority. Within those boundaries, remaining
   long-window quota and time to reset are combined as quota pressure.
+
+`max_inflight_requests_per_auth` limits conservative logical-request slots per
+auth instance. `0` is unlimited. When a logical request retries from auth A to
+auth B, both slots remain reserved until CPA emits `request.complete`. Optional
+plugin session affinity uses a private cache and switches to the next eligible
+auth when the bound auth is full. This lifecycle integration is implemented and
+tested against CPA v7.2.152; older CPA versions are not supported for this
+feature. If every eligible auth is full, the plugin rejects the scheduler pick;
+CPA v7.2.152 maps that plain scheduler error to HTTP 500 instead of falling back
+to an unlimited built-in selector.
 
 `quota_endpoint` is restricted to the expected ChatGPT quota endpoint and cannot
 be redirected to an arbitrary host.

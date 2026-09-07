@@ -39,6 +39,9 @@ type Config struct {
 	EnableResetProbe                bool
 	ProbeOnProvisionalRoster        bool
 	MaxRefreshConcurrency           int
+	MaxInflightRequestsPerAuth      int
+	SessionAffinityEnabled          bool
+	SessionAffinityTTL              time.Duration
 	QuotaEndpoint                   string
 	RefreshActiveWindow             time.Duration
 	RefreshAfterResetDelay          time.Duration
@@ -58,9 +61,11 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	Scheduler     bool `json:"scheduler"`
-	UsagePlugin   bool `json:"usage_plugin"`
-	ManagementAPI bool `json:"management_api"`
+	Scheduler              bool `json:"scheduler"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	RequestLifecyclePlugin bool `json:"request_lifecycle_plugin"`
+	UsagePlugin            bool `json:"usage_plugin"`
+	ManagementAPI          bool `json:"management_api"`
 }
 
 type rawConfig struct {
@@ -73,6 +78,9 @@ type rawConfig struct {
 	EnableResetProbe                *bool  `yaml:"enable_reset_probe"`
 	ProbeOnProvisionalRoster        *bool  `yaml:"probe_on_provisional_roster"`
 	MaxRefreshConcurrency           *int   `yaml:"max_refresh_concurrency"`
+	MaxInflightRequestsPerAuth      *int   `yaml:"max_inflight_requests_per_auth"`
+	SessionAffinityEnabled          *bool  `yaml:"session_affinity_enabled"`
+	SessionAffinityTTL              string `yaml:"session_affinity_ttl"`
 	QuotaEndpoint                   string `yaml:"quota_endpoint"`
 	RefreshActiveWindow             string `yaml:"refresh_active_window"`
 	RefreshAfterResetDelay          string `yaml:"refresh_after_reset_delay"`
@@ -95,6 +103,9 @@ func DefaultConfig() Config {
 		EnableUsageFeedback:             true,
 		EnableResetProbe:                false,
 		MaxRefreshConcurrency:           1,
+		MaxInflightRequestsPerAuth:      0,
+		SessionAffinityEnabled:          false,
+		SessionAffinityTTL:              time.Hour,
 		QuotaEndpoint:                   chatGPTQuotaEndpoint,
 		RefreshActiveWindow:             time.Hour,
 		RefreshAfterResetDelay:          time.Minute,
@@ -124,6 +135,12 @@ func NormalizeConfig(cfg Config) Config {
 	}
 	if cfg.MaxRefreshConcurrency <= 0 {
 		cfg.MaxRefreshConcurrency = defaults.MaxRefreshConcurrency
+	}
+	if cfg.MaxInflightRequestsPerAuth < 0 {
+		cfg.MaxInflightRequestsPerAuth = 0
+	}
+	if cfg.SessionAffinityTTL <= 0 {
+		cfg.SessionAffinityTTL = defaults.SessionAffinityTTL
 	}
 	if strings.TrimSpace(cfg.QuotaEndpoint) == "" {
 		cfg.QuotaEndpoint = defaults.QuotaEndpoint
@@ -212,6 +229,25 @@ func DecodeConfig(raw []byte) (Config, error) {
 			return Config{}, fmt.Errorf("max_refresh_concurrency must be positive")
 		}
 		cfg.MaxRefreshConcurrency = *decoded.MaxRefreshConcurrency
+	}
+	if decoded.MaxInflightRequestsPerAuth != nil {
+		if *decoded.MaxInflightRequestsPerAuth < 0 {
+			return Config{}, fmt.Errorf("max_inflight_requests_per_auth must be non-negative")
+		}
+		cfg.MaxInflightRequestsPerAuth = *decoded.MaxInflightRequestsPerAuth
+	}
+	if decoded.SessionAffinityEnabled != nil {
+		cfg.SessionAffinityEnabled = *decoded.SessionAffinityEnabled
+	}
+	if decoded.SessionAffinityTTL != "" {
+		d, err := time.ParseDuration(decoded.SessionAffinityTTL)
+		if err != nil {
+			return Config{}, fmt.Errorf("session_affinity_ttl: %w", err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("session_affinity_ttl must be positive")
+		}
+		cfg.SessionAffinityTTL = d
 	}
 	if decoded.QuotaEndpoint != "" {
 		endpoint, err := validateQuotaEndpoint(decoded.QuotaEndpoint)
@@ -349,9 +385,11 @@ func PluginRegistration() registration {
 			Logo:             "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI/main/docs/logo.png",
 		},
 		Capabilities: registrationCapabilities{
-			Scheduler:     true,
-			UsagePlugin:   true,
-			ManagementAPI: true,
+			Scheduler:              true,
+			RequestInterceptor:     true,
+			RequestLifecyclePlugin: true,
+			UsagePlugin:            true,
+			ManagementAPI:          true,
 		},
 	}
 }

@@ -13,6 +13,7 @@ type PickDecision struct {
 	DelegateBuiltin string
 	Reason          string
 	Ordered         []ScheduledAccount
+	Err             error
 }
 
 type ScheduledAccount struct {

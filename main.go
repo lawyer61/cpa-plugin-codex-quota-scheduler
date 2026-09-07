@@ -275,6 +275,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	stopGlobalPickActivityPump()
+	globalInFlightTracker.Stop()
 	refresherMu.Lock()
 	refresher := globalRefresher
 	globalRefresher = nil

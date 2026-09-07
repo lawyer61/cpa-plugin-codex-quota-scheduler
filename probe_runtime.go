@@ -1018,6 +1018,9 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			var activationStatus probeActivationStatusError
 			var status quotaStatusError
 			switch {
+			case errors.Is(err, ErrInflightCapacity):
+				failureFields["error"] = "inflight_capacity_full"
+				failureFields["error_category"] = "scheduling"
 			case errors.As(err, &activationStatus):
 				failureFields["error"] = "activation_http_status"
 				failureFields["error_category"] = "upstream_http"
@@ -1138,6 +1141,16 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return res
 		}
 		r.probeHoldMu.Unlock()
+		releaseCapacity := func() {}
+		if limit := r.state.Config().MaxInflightRequestsPerAuth; limit > 0 {
+			stage = "activation_capacity"
+			var reserveErr error
+			releaseCapacity, reserveErr = globalInFlightTracker.ReserveSynthetic("probe:"+attempt.AttemptID, intent.Instance, intent.AuthID, limit)
+			if reserveErr != nil {
+				return fail(reserveErr, false)
+			}
+			defer releaseCapacity()
+		}
 		fence, err := r.probeFence.Next()
 		if err != nil {
 			return fail(err, false)
@@ -1165,6 +1178,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 				return nil
 			})
 		})
+		releaseCapacity()
 		if err != nil {
 			return fail(err, true)
 		}

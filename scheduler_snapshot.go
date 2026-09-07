@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -8,16 +9,19 @@ import (
 )
 
 type SchedulerSnapshot struct {
-	HandleEnabled     bool
-	Fallback          FallbackMode
-	MonthlyMode       MonthlyMode
-	Accounts          []AccountView
-	ActiveHighestTier map[string]struct{}
-	Trials            *TrialRegistry
-	EvidenceIntents   chan<- EvidenceIntent
-	AdmissionVersion  uint64
-	Activity          func(pluginapi.SchedulerPickRequest, uint64, time.Time)
-	Observation       func(pluginapi.SchedulerPickRequest, PickDecision, time.Time)
+	HandleEnabled              bool
+	Fallback                   FallbackMode
+	MonthlyMode                MonthlyMode
+	MaxInflightRequestsPerAuth int
+	SessionAffinityEnabled     bool
+	Accounts                   []AccountView
+	ActiveHighestTier          map[string]struct{}
+	Trials                     *TrialRegistry
+	InFlight                   *InFlightTracker
+	EvidenceIntents            chan<- EvidenceIntent
+	AdmissionVersion           uint64
+	Activity                   func(pluginapi.SchedulerPickRequest, uint64, time.Time)
+	Observation                func(pluginapi.SchedulerPickRequest, PickDecision, time.Time)
 }
 
 type EvidenceIntent struct {
@@ -63,9 +67,55 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 		snapshot.Activity(req, snapshot.AdmissionVersion, now)
 	}
 	candidates := make([]Candidate, 0, len(req.Candidates))
-	for _, c := range req.Candidates {
-		candidates = append(candidates, Candidate{ID: c.ID, Provider: c.Provider})
+	for _, candidate := range req.Candidates {
+		candidates = append(candidates, Candidate{ID: candidate.ID, Provider: candidate.Provider})
 	}
+	if snapshot.MaxInflightRequestsPerAuth == 0 && !snapshot.SessionAffinityEnabled {
+		return pickPublishedUntracked(snapshot, req, candidates, now)
+	}
+	if snapshot.InFlight == nil {
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reason: "request_correlation_unavailable", Err: ErrRequestCorrelation}, now)
+	}
+	requestID := schedulerRequestID(req.Options.Headers)
+	if requestID == "" {
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reason: "request_correlation_missing", Err: ErrRequestCorrelation}, now)
+	}
+	affinityKey := snapshot.InFlight.AffinityKey(requestID, schedulerAffinityProvider(req), req.Model)
+	skipped := make(map[AuthInstanceID]struct{})
+	capacityBlocked := false
+	if affinityKey != "" {
+		if boundAuthID, ok := snapshot.InFlight.BoundAuth(affinityKey); ok {
+			result := selectAccountByAuthID(*snapshot, candidates, boundAuthID, now, snapshot.Trials)
+			if result.AuthID != "" {
+				decision, selected, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
+				if selected {
+					return decision
+				}
+				capacityBlocked = full
+				skipped[result.Instance] = struct{}{}
+			}
+		}
+	}
+	for {
+		result := selectAccountSkipping(*snapshot, candidates, now, skipped, snapshot.Trials)
+		if result.AuthID == "" {
+			if capacityBlocked {
+				return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reason: "inflight_capacity_full", Err: ErrInflightCapacity}, now)
+			}
+			return publishedFallbackDecision(snapshot, req, result, now)
+		}
+		decision, selected, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
+		if selected {
+			return decision
+		}
+		if full {
+			capacityBlocked = true
+		}
+		skipped[result.Instance] = struct{}{}
+	}
+}
+
+func pickPublishedUntracked(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, candidates []Candidate, now time.Time) PickDecision {
 	result := selectAccountSkipping(*snapshot, candidates, now, nil, snapshot.Trials)
 	var skipped map[AuthInstanceID]struct{}
 	for result.AuthID != "" && result.Class == Opportunistic && (snapshot.Trials == nil || !snapshot.Trials.TryBegin(result.Instance, now)) {
@@ -85,10 +135,57 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 	if result.AuthID != "" {
 		return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now)
 	}
+	return publishedFallbackDecision(snapshot, req, result, now)
+}
+
+func reservePublishedSelection(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, result SelectionResult, requestID, affinityKey string, now time.Time) (PickDecision, bool, bool) {
+	allowed, added := snapshot.InFlight.TryAcquire(requestID, result.Instance, result.AuthID, snapshot.MaxInflightRequestsPerAuth)
+	if !allowed {
+		return PickDecision{}, false, true
+	}
+	if result.Class == Opportunistic && added && (snapshot.Trials == nil || !snapshot.Trials.TryBegin(result.Instance, now)) {
+		snapshot.InFlight.Rollback(requestID, result.Instance)
+		return PickDecision{}, false, false
+	}
+	if result.Class == Opportunistic && added {
+		select {
+		case snapshot.EvidenceIntents <- EvidenceIntent{AuthID: result.AuthID, Instance: result.Instance, BeganAt: now}:
+			snapshot.Trials.MarkEvidencePending(result.Instance, true)
+		default:
+		}
+	}
+	if affinityKey != "" {
+		snapshot.InFlight.BindAuth(affinityKey, result.AuthID)
+	}
+	return observeSchedulerDecision(snapshot, req, PickDecision{AuthID: result.AuthID, Handled: true, Reason: "selected"}, now), true, false
+}
+
+func publishedFallbackDecision(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, result SelectionResult, now time.Time) PickDecision {
 	if snapshot.Fallback == FallbackFillFirst {
 		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst, Reason: result.Reason}, now)
 	}
 	return observeSchedulerDecision(snapshot, req, PickDecision{Reason: result.Reason}, now)
+}
+
+func schedulerRequestID(headers map[string][]string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, inFlightRequestHeader) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func schedulerAffinityProvider(req pluginapi.SchedulerPickRequest) string {
+	if provider := strings.ToLower(strings.TrimSpace(req.Provider)); provider != "" {
+		return provider
+	}
+	return "codex"
 }
 
 func observeSchedulerDecision(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, decision PickDecision, now time.Time) PickDecision {
@@ -110,7 +207,7 @@ func schedulerSnapshotFromState(state StateSnapshot, trials *TrialRegistry) *Sch
 		activity = pump.enqueue
 		observation = pump.enqueueObservation
 	}
-	return &SchedulerSnapshot{HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, Accounts: accounts, ActiveHighestTier: active, Trials: trials, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
+	return &SchedulerSnapshot{HandleEnabled: state.Config.HandleEnabled, Fallback: state.Config.Fallback, MonthlyMode: state.Config.MonthlyMode, MaxInflightRequestsPerAuth: state.Config.MaxInflightRequestsPerAuth, SessionAffinityEnabled: state.Config.SessionAffinityEnabled, Accounts: accounts, ActiveHighestTier: active, Trials: trials, InFlight: globalInFlightTracker, EvidenceIntents: globalEvidenceIntents, Activity: activity, Observation: observation}
 }
 
 func accountViewFromState(a AccountState, cfg Config, now time.Time, trials *TrialRegistry) AccountView {

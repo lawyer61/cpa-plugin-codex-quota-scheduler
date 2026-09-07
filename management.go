@@ -88,6 +88,9 @@ type SettingsPayload struct {
 	EnableResetProbe                bool        `json:"enable_reset_probe"`
 	ProbeOnProvisionalRoster        bool        `json:"probe_on_provisional_roster"`
 	MaxRefreshConcurrency           int         `json:"max_refresh_concurrency"`
+	MaxInflightRequestsPerAuth      int         `json:"max_inflight_requests_per_auth"`
+	SessionAffinityEnabled          bool        `json:"session_affinity_enabled"`
+	SessionAffinityTTL              string      `json:"session_affinity_ttl"`
 	QuotaEndpoint                   string      `json:"quota_endpoint"`
 	RefreshActiveWindow             string      `json:"refresh_active_window"`
 	RefreshAfterResetDelay          string      `json:"refresh_after_reset_delay"`
@@ -111,6 +114,9 @@ type StatusAccount struct {
 	Tags                         []string           `json:"tags,omitempty"`
 	CPAPriority                  int                `json:"cpa_priority"`
 	SchedulerPriority            int                `json:"scheduler_priority"`
+	InflightRequests             int                `json:"inflight_requests"`
+	MaxInflightRequests          int                `json:"max_inflight_requests"`
+	CapacityFull                 bool               `json:"capacity_full"`
 	Family                       AccountFamily      `json:"family"`
 	QueueStatus                  QueueStatus        `json:"queue_status"`
 	Available                    bool               `json:"available"`
@@ -307,6 +313,9 @@ func SettingsFromConfig(cfg Config) SettingsPayload {
 		EnableResetProbe:                cfg.EnableResetProbe,
 		ProbeOnProvisionalRoster:        cfg.ProbeOnProvisionalRoster,
 		MaxRefreshConcurrency:           cfg.MaxRefreshConcurrency,
+		MaxInflightRequestsPerAuth:      cfg.MaxInflightRequestsPerAuth,
+		SessionAffinityEnabled:          cfg.SessionAffinityEnabled,
+		SessionAffinityTTL:              cfg.SessionAffinityTTL.String(),
 		QuotaEndpoint:                   cfg.QuotaEndpoint,
 		RefreshActiveWindow:             cfg.RefreshActiveWindow.String(),
 		RefreshAfterResetDelay:          cfg.RefreshAfterResetDelay.String(),
@@ -350,6 +359,18 @@ func ConfigFromSettings(base Config, payload SettingsPayload) (Config, error) {
 		return Config{}, jsonError("max_refresh_concurrency must be positive")
 	}
 	cfg.MaxRefreshConcurrency = payload.MaxRefreshConcurrency
+	if payload.MaxInflightRequestsPerAuth < 0 {
+		return Config{}, jsonError("max_inflight_requests_per_auth must be non-negative")
+	}
+	cfg.MaxInflightRequestsPerAuth = payload.MaxInflightRequestsPerAuth
+	cfg.SessionAffinityEnabled = payload.SessionAffinityEnabled
+	if payload.SessionAffinityTTL != "" {
+		d, err := time.ParseDuration(payload.SessionAffinityTTL)
+		if err != nil || d <= 0 {
+			return Config{}, jsonError("session_affinity_ttl must be a positive duration")
+		}
+		cfg.SessionAffinityTTL = d
+	}
 	if strings.TrimSpace(payload.QuotaEndpoint) != "" {
 		endpoint, err := validateQuotaEndpoint(payload.QuotaEndpoint)
 		if err != nil {
@@ -426,6 +447,7 @@ func handlePutSettings(store *PluginState, req pluginapi.ManagementRequest, now 
 	}
 	resp := saveSettingsPayload(store, payload)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		republishSchedulerConfig(store, now)
 		store.RecordLog("info", "ui.settings_saved", "页面保存调度设置", nil, now)
 	}
 	return resp
@@ -444,6 +466,7 @@ func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.
 	}
 	store.ReplaceConfig(cfg)
 	currentConfig.Store(cfg)
+	globalInFlightTracker.ConfigureAffinity(cfg.SessionAffinityEnabled, cfg.SessionAffinityTTL)
 	if cfg.ProbeOnProvisionalRoster != previousRisk {
 		managementProvisionalRiskChanged(cfg.ProbeOnProvisionalRoster)
 	}
@@ -494,13 +517,21 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	if _, err := validateQuotaEndpoint(state.Config.QuotaEndpoint); err != nil {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
+	if state.Config.MaxInflightRequestsPerAuth < 0 {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "max_inflight_requests_per_auth must be non-negative"})
+	}
+	if state.Config.SessionAffinityTTL < 0 {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "session_affinity_ttl must be non-negative"})
+	}
 	state = normalizePluginDiskState(state)
 	if err := SaveUserData(semanticStatePaths(defaultStatePath()).UserData, state); err != nil {
 		return jsonManagementResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	store.ReplaceConfig(state.Config)
 	currentConfig.Store(state.Config)
+	globalInFlightTracker.ConfigureAffinity(state.Config.SessionAffinityEnabled, state.Config.SessionAffinityTTL)
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
+	republishSchedulerConfig(store, now)
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})
 }
@@ -509,7 +540,19 @@ func BuildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount) Stat
 	return buildStatusPayload(snapshot, ordered, nil)
 }
 
+func republishSchedulerConfig(store *PluginState, now time.Time) {
+	if store == nil {
+		return
+	}
+	var active map[string]struct{}
+	if current := publishedSchedulerSnapshot.Load(); current != nil {
+		active = cloneStringSet(current.ActiveHighestTier)
+	}
+	publishSchedulerState(store, active, now)
+}
+
 func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, lifecycle *ManagementLifecycleSnapshot) StatusPayload {
+	inflight := globalInFlightTracker.Snapshot()
 	accountsByAuthID := make(map[string]AccountState, len(snapshot.Accounts))
 	for _, account := range snapshot.Accounts {
 		if account.AuthID != "" {
@@ -564,28 +607,31 @@ func buildStatusPayload(snapshot StateSnapshot, ordered []ScheduledAccount, life
 		}
 
 		status := StatusAccount{
-			Rank:              i + 1,
-			AuthID:            scheduled.AuthID,
-			Alias:             scheduled.Annotation.Alias,
-			Notes:             scheduled.Annotation.Notes,
-			GroupID:           groupID,
-			Group:             groupName,
-			GroupNotes:        groupNotes,
-			Tags:              cloneStringSlice(scheduled.Annotation.Tags),
-			CPAPriority:       scheduled.CPAPriority,
-			SchedulerPriority: scheduled.SchedulerPriority,
-			Family:            scheduled.Family,
-			QueueStatus:       scheduled.QueueStatus,
-			Available:         scheduled.Available,
-			UnavailableReason: scheduled.UnavailableReason,
-			ResetExpiry:       scheduled.SortTime,
-			ResetExpiryText:   formatTime(scheduled.SortTime),
-			LastError:         account.LastError,
-			NextRetryText:     formatTime(account.Refresh.NextRetryAt),
-			AuthFailure:       account.Refresh.AuthFailure,
-			FiveHour:          statusWindow(account.Quota.FiveHour, "5 小时额度"),
-			LongWindow:        statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
+			Rank:                i + 1,
+			AuthID:              scheduled.AuthID,
+			Alias:               scheduled.Annotation.Alias,
+			Notes:               scheduled.Annotation.Notes,
+			GroupID:             groupID,
+			Group:               groupName,
+			GroupNotes:          groupNotes,
+			Tags:                cloneStringSlice(scheduled.Annotation.Tags),
+			CPAPriority:         scheduled.CPAPriority,
+			SchedulerPriority:   scheduled.SchedulerPriority,
+			InflightRequests:    inflight.Counts[account.Instance],
+			MaxInflightRequests: snapshot.Config.MaxInflightRequestsPerAuth,
+			Family:              scheduled.Family,
+			QueueStatus:         scheduled.QueueStatus,
+			Available:           scheduled.Available,
+			UnavailableReason:   scheduled.UnavailableReason,
+			ResetExpiry:         scheduled.SortTime,
+			ResetExpiryText:     formatTime(scheduled.SortTime),
+			LastError:           account.LastError,
+			NextRetryText:       formatTime(account.Refresh.NextRetryAt),
+			AuthFailure:         account.Refresh.AuthFailure,
+			FiveHour:            statusWindow(account.Quota.FiveHour, "5 小时额度"),
+			LongWindow:          statusWindow(account.Quota.LongWindow, longWindowLabelCN(account.Family)),
 		}
+		status.CapacityFull = status.MaxInflightRequests > 0 && status.InflightRequests >= status.MaxInflightRequests
 		_, status.RefreshDueReason = accountRefreshDue(account, snapshot.Config, snapshot.Now)
 		status.StatusNote = accountStatusNote(account, status.RefreshDueReason, snapshot, payload.RefreshActive)
 		status.Circuit = statusCircuit(account.Circuit, snapshot.Now)
@@ -1250,6 +1296,9 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <label class="field"><span data-i18n="settings.refreshRetryDelays">刷新失败重试间隔</span><input id="refreshRetryDelays" spellcheck="false"></label>
 <label class="toggle"><span data-i18n="settings.refreshOnStartup">启动时刷新额度</span><input id="refreshOnStartup" type="checkbox"></label>
 <label class="field"><span data-i18n="settings.maxConcurrency">最大并发刷新</span><input id="maxConcurrency" type="number" min="1" step="1"></label>
+<div class="setting-with-help"><label class="field"><span data-i18n="settings.maxInflight">每个 auth 最大并发占位</span><input id="maxInflight" type="number" min="0" step="1"></label><p class="setting-help" data-i18n="settings.maxInflightHelp">0 表示不限制。一个逻辑请求重试多个 auth 时会保守占用每个已尝试 auth，直到整个请求结束。</p></div>
+<label class="toggle"><span data-i18n="settings.sessionAffinityEnabled">启用插件会话亲和</span><input id="sessionAffinityEnabled" type="checkbox"></label>
+<label class="field"><span data-i18n="settings.sessionAffinityTTL">插件会话亲和 TTL</span><input id="sessionAffinityTTL" spellcheck="false"></label>
 <label class="field"><span data-i18n="settings.circuitFailureThreshold">熔断失败阈值</span><input id="circuitFailureThreshold" type="number" min="1" step="1"></label>
 <label class="field"><span data-i18n="settings.circuitOpenDuration">熔断等待时间</span><input id="circuitOpenDuration" spellcheck="false"></label>
 <label class="field"><span data-i18n="settings.circuitHalfOpenSuccessThreshold">半开恢复成功次数</span><input id="circuitHalfOpenSuccessThreshold" type="number" min="1" step="1"></label>
@@ -1264,7 +1313,7 @@ var statusTemplateV2 = template.Must(template.New("status-v2").Funcs(template.Fu
 <div class="toolbar"><div><h2 data-i18n="queue.title">账号队列</h2><p data-i18n="queue.description">账号卡片按当前调度优先级排序。第一个可用账号就是下一次 Codex 请求会优先选择的账号。</p></div><div class="metrics"><span class="metric"><span data-i18n="metrics.nextAccount">下一账号</span><span class="localeColon">：</span><code id="metricNextAuthID">{{if .NextAuthID}}{{.NextAuthID}}{{else}}暂无{{end}}</code></span><span class="metric"><span data-i18n="metrics.monthlyMode">Monthly</span><span class="localeColon">：</span><code id="metricMonthlyMode">{{if eq .MonthlyMode "priority"}}优先使用{{else}}按到期时间{{end}}</code></span><span class="metric"><span data-i18n="metrics.lastSelected">最近选择</span><span class="localeColon">：</span><code id="metricLastSelected">{{if .LastSelected}}{{.LastSelected}}{{else}}暂无{{end}}</code></span></div></div>
 <section class="queue" aria-label="账号卡片" data-i18n-aria="queue.aria">{{range .Accounts}}<article class="card {{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}next{{end}}" data-auth-id="{{.AuthID}}">
 <div class="cardTop"><div class="identity"><div class="titleLine"><span class="title">{{if .Alias}}{{.Alias}}{{else}}{{.AuthID}}{{end}}</span>{{if .Group}}<span class="groupPill">{{.Group}}</span>{{end}}</div><div class="sub"><code>{{.AuthID}}</code></div>{{if .Tags}}<div class="metaLine">{{range .Tags}}<span class="chip">{{.}}</span>{{end}}</div>{{end}}</div><span class="rank">#{{.Rank}}</span></div>
-<div class="badges">{{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}<span class="badge next">下一优先</span>{{end}}{{if .Available}}<span class="badge ok">可用</span>{{else}}<span class="badge no">{{.UnavailableReason}}</span>{{end}}<span class="badge">{{if eq .Family "weekly"}}Weekly{{else if eq .Family "monthly"}}Monthly{{else}}未知类型{{end}}</span><span class="badge">CPA 优先级 {{.CPAPriority}}</span><span class="badge">插件优先级 {{.SchedulerPriority}}</span><span class="badge">熔断：{{.Circuit.Label}}</span></div>
+<div class="badges">{{if and $.NextAuthID (eq $.NextAuthID .AuthID)}}<span class="badge next">下一优先</span>{{end}}{{if .Available}}<span class="badge ok">可用</span>{{else}}<span class="badge no">{{.UnavailableReason}}</span>{{end}}<span class="badge">{{if eq .Family "weekly"}}Weekly{{else if eq .Family "monthly"}}Monthly{{else}}未知类型{{end}}</span><span class="badge">CPA 优先级 {{.CPAPriority}}</span><span class="badge">插件优先级 {{.SchedulerPriority}}</span><span class="badge {{if .CapacityFull}}no{{end}}">并发占位 {{.InflightRequests}} / {{if gt .MaxInflightRequests 0}}{{.MaxInflightRequests}}{{else}}不限{{end}}</span><span class="badge">熔断：{{.Circuit.Label}}</span></div>
 <div class="quotaList">{{if not .FiveHour.Missing}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.FiveHour.Label}}</span><span class="quota-remaining">{{.FiveHour.DisplayText}}</span><span class="quota-reset"><span class="quota-reset-label" data-label="5 小时额度">5 小时额度 重置：</span><span class="localTime quotaResetTime" data-time="{{.FiveHour.ResetText}}">{{.FiveHour.ResetText}}</span></span></div><div class="quota-bar"><div class="quota-fill {{if or .FiveHour.Exhausted (lt .FiveHour.RemainingPercent 30.0)}}danger{{else if lt .FiveHour.RemainingPercent 60.0}}warn{{end}}" style="width:{{printf "%.0f" .FiveHour.RemainingPercent}}%"></div></div></div>{{end}}<div class="quota-row"><div class="quota-head"><span class="quota-title">{{.LongWindow.Label}}</span><span class="quota-remaining">{{.LongWindow.DisplayText}}</span>{{if not .LongWindow.Missing}}<span class="quota-reset"><span class="quota-reset-label" data-label="{{.LongWindow.Label}}">{{.LongWindow.Label}} 重置：</span><span class="localTime quotaResetTime" data-time="{{.LongWindow.ResetText}}">{{.LongWindow.ResetText}}</span></span>{{end}}</div><div class="quota-bar"><div class="quota-fill {{if not .LongWindow.Missing}}{{if or .LongWindow.Exhausted (lt .LongWindow.RemainingPercent 30.0)}}danger{{else if lt .LongWindow.RemainingPercent 60.0}}warn{{end}}{{end}}" style="width:{{printf "%.0f" .LongWindow.RemainingPercent}}%"></div></div></div></div>
 <div class="kv"><span>缓存时间</span><span>{{if .CacheAge}}{{.CacheAge}}{{else}}暂无{{end}}</span><span>熔断计数</span><span>失败 {{.Circuit.FailureCount}} / 成功 {{.Circuit.SuccessCount}}{{if .Circuit.NextProbeText}}，半开 <span class="localTime" data-time="{{.Circuit.NextProbeText}}">{{.Circuit.NextProbeText}}</span>{{end}}</span><span>主动重置</span><span>{{if .ResetCreditsAvailableCount}}{{.ResetCreditsAvailableCount}} 次{{else}}暂无{{end}}{{if .ResetCreditsTotalEarnedCount}} / 累计 {{.ResetCreditsTotalEarnedCount}} 次{{end}}{{range .ResetCredits}}；{{if .Status}}{{.Status}} {{end}}有效期 <span class="localTime" data-time="{{.ExpiresAt}}">{{.ExpiresAt}}</span>{{end}}</span></div>
 {{if or .Notes .GroupNotes}}<div class="noteBlock">{{if .Notes}}<div>账号备注：{{.Notes}}</div>{{end}}{{if .GroupNotes}}<div>分组备注：{{.GroupNotes}}</div>{{end}}</div>{{end}}
@@ -1283,18 +1332,18 @@ const TRANSLATIONS={
   en:{
     'app.title':'Codex Quota Scheduler','app.subtitle':'Optimized Fill First scheduling. Configuration, aliases, groups, tags, and notes are saved in the plugin state file.','app.language':'Language','connection.managementKey':'CPA management key','connection.rememberManagementKey':'Remember management key in this browser','connection.rememberManagementKeyHelp':'The key will be stored unencrypted in browser local storage. Enable this only on a trusted device.','connection.backgroundHint':'Once the scheduler is enabled, it runs in the background. This page does not need to stay open.',
     'resetProbe.warningTitle':'Automatic reset probe is off by default','resetProbe.warningBody':'Only after you check the box will the scheduler send one tiny Codex request when a reset looks lazy, nudging the next quota window to start.',
-    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'Probe performs read-only checks at the quota refresh interval with a 30-minute minimum, even while normal refresh is dormant, and sends one tiny request only after detecting a lazy reset window. This may consume a small amount of quota.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
+    'settings.title':'Scheduler Settings','settings.summary':'Default configuration is ready; normally no manual changes are needed.','settings.handleEnabled':'Enable scheduler takeover','settings.usageFeedback':'Mark quota exhausted from failure feedback','settings.enableResetProbe':'Enable automatic reset probe','settings.enableResetProbeHelp':'Probe performs read-only checks at the quota refresh interval with a 30-minute minimum, even while normal refresh is dormant, and sends one tiny request only after detecting a lazy reset window. This may consume a small amount of quota.','settings.provisionalProbe':'Allow quota probes when the account roster is unconfirmed (high risk)','settings.provisionalProbeHelp':'When CPA temporarily cannot confirm the current accounts and priorities, allow the plugin to use the most recently saved account roster for quota reset probes. Account credentials are revalidated every time, but the plugin still cannot guarantee that accounts have not been removed or reprioritized. This should normally remain off.','settings.monthlyMode':'Monthly mode','settings.expiryOrder':'Sort by expiry time','settings.monthlyPriority':'Prefer Monthly','settings.refreshInterval':'Quota refresh interval','settings.staleAfter':'Stale cache threshold','settings.refreshActiveWindow':'Refresh active window','settings.refreshAfterResetDelay':'Refresh after reset delay','settings.refreshRetryDelays':'Refresh retry delays','settings.refreshOnStartup':'Refresh on startup','settings.maxConcurrency':'Max refresh concurrency','settings.maxInflight':'Max in-flight slots per auth','settings.maxInflightHelp':'0 means unlimited. When one logical request retries multiple auths, every attempted auth remains conservatively occupied until the whole request completes.','settings.sessionAffinityEnabled':'Enable plugin session affinity','settings.sessionAffinityTTL':'Plugin session affinity TTL','settings.circuitFailureThreshold':'Circuit failure threshold','settings.circuitOpenDuration':'Circuit open duration','settings.circuitHalfOpenSuccessThreshold':'Half-open recovery successes','settings.maxLogEntries':'Max log entries','settings.logRetention':'Log retention',
     'actions.loadData':'Load Data','actions.saveSettings':'Save Settings','actions.refreshQuota':'Refresh Quota','actions.exportConfig':'Export Config','actions.importConfig':'Import Config','actions.refreshLogs':'Refresh Logs','actions.exportLogs':'Export Logs','actions.close':'Close','actions.saveAccount':'Save Account','actions.cancel':'Cancel',
     'queue.title':'Account Queue','queue.description':'Account cards are sorted by the current scheduler priority. The first available account is preferred for the next Codex request.','queue.aria':'Account cards','metrics.nextAccount':'Next account','metrics.monthlyMode':'Monthly','metrics.lastSelected':'Last selected',
     'logs.title':'Scheduler Logs','logs.empty':'No logs yet. Send a request or refresh quota manually to show records here.',
     'edit.title':'Edit Account','edit.alias':'Alias','account.schedulerPriority':'Plugin priority','edit.groupID':'Group ID','edit.groupName':'Group name','edit.tags':'Tags','edit.notes':'Account notes','edit.groupNotes':'Group notes',
     'notice.settingsSaved':'Settings saved.','notice.statusLoaded':'Current settings loaded. Review them, then save again.','notice.refreshRequested':'Background quota refresh requested.','notice.accountSaved':'Account card saved.','notice.refreshOneRequested':'Quota refresh requested for this account.','notice.configExported':'Configuration exported.','notice.logsExported':'Logs exported.','notice.configImported':'Configuration imported.','error.requestFailed':'Request failed: {status}','error.managementKeyRequired':'CPA management key is required','error.schedulerPriorityInteger':'Plugin priority must be a safe integer.',
-    'log.ui.refresh_requested':'UI requested quota refresh','log.ui.settings_saved':'UI saved scheduler settings','log.ui.refresh_one_requested':'UI requested one account quota refresh','log.ui.config_exported':'UI exported plugin configuration','log.ui.config_imported':'UI imported plugin configuration','log.ui.account_saved':'UI saved account card','log.ui.group_saved':'UI saved account group','log.scheduler.selected':'Request handled by plugin','log.scheduler.fallback':'Plugin delegated to the built-in scheduler','log.scheduler.unhandled':'Request was not handled by the plugin','log.scheduler.handled':'Plugin handled the request without selecting an account','log.quota.refresh_success':'Account quota refreshed successfully','log.quota.refresh_failed':'Account quota refresh failed','log.quota.refresh_one_failed':'Single-account quota refresh failed','log.quota.refresh_requested':'Background quota refresh requested','log.quota.refresh_one_requested':'Single-account quota refresh requested','log.quota.temporary_exhausted':'Account quota exhausted; waiting for reset','log.circuit.success':'Successful request updated the circuit state','log.probe.precheck_started':'Checking a suspected lazy quota window','log.probe.activation_sent':'Tiny activation request sent','log.probe.verified':'Quota-window activation verified','log.probe.failed':'Quota-window probe failed and was handled safely'
+    'log.ui.refresh_requested':'UI requested quota refresh','log.ui.settings_saved':'UI saved scheduler settings','log.ui.refresh_one_requested':'UI requested one account quota refresh','log.ui.config_exported':'UI exported plugin configuration','log.ui.config_imported':'UI imported plugin configuration','log.ui.account_saved':'UI saved account card','log.ui.group_saved':'UI saved account group','log.scheduler.selected':'Request handled by plugin','log.scheduler.rejected':'Request rejected by plugin capacity policy','log.scheduler.fallback':'Plugin delegated to the built-in scheduler','log.scheduler.unhandled':'Request was not handled by the plugin','log.scheduler.handled':'Plugin handled the request without selecting an account','log.quota.refresh_success':'Account quota refreshed successfully','log.quota.refresh_failed':'Account quota refresh failed','log.quota.refresh_one_failed':'Single-account quota refresh failed','log.quota.refresh_requested':'Background quota refresh requested','log.quota.refresh_one_requested':'Single-account quota refresh requested','log.quota.temporary_exhausted':'Account quota exhausted; waiting for reset','log.circuit.success':'Successful request updated the circuit state','log.probe.precheck_started':'Checking a suspected lazy quota window','log.probe.activation_sent':'Tiny activation request sent','log.probe.verified':'Quota-window activation verified','log.probe.failed':'Quota-window probe failed and was handled safely'
   },
   'zh-CN':{
     'app.title':'Codex 额度调度器','app.subtitle':'优化版 Fill First。配置、别名、分组、标签和备注由插件内部状态文件保存。','app.language':'界面语言','connection.managementKey':'CPA 管理密钥','connection.rememberManagementKey':'在此浏览器中记住管理密钥','connection.rememberManagementKeyHelp':'密钥将以未加密形式保存在浏览器本地存储中。请仅在受信任的设备上启用。','connection.backgroundHint':'只要调度器启动了，它就会在后台自动运行，无需保持页面开启。',
     'resetProbe.warningTitle':'自动激活新的额度周期默认关闭','resetProbe.warningBody':'开启后，调度器会在额度重置时间已到但新周期尚未生成时，发送一次极小的 Codex 请求尝试激活新周期。',
-    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'即使普通刷新处于休眠状态，Probe 也会按额度刷新间隔执行只读检查，最短 30 分钟；只有检测到延迟启动的重置窗口时，才发送一次极小请求。可能消耗少量额度。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
+    'settings.title':'调度设置','settings.summary':'默认配置已经都设置好了，正常情况下不需要手动设置。','settings.handleEnabled':'启用调度接管','settings.usageFeedback':'失败反馈标记额度耗尽','settings.enableResetProbe':'自动激活新的额度周期','settings.enableResetProbeHelp':'即使普通刷新处于休眠状态，Probe 也会按额度刷新间隔执行只读检查，最短 30 分钟；只有检测到延迟启动的重置窗口时，才发送一次极小请求。可能消耗少量额度。','settings.provisionalProbe':'账号列表未确认时仍允许额度探测（高风险）','settings.provisionalProbeHelp':'CPA 暂时无法确认当前账号及优先级时，允许插件使用最近一次保存的账号列表执行额度重置探测。每次都会重新验证账号凭据，但仍无法保证账号未被删除或调整优先级。通常应保持关闭。','settings.monthlyMode':'月度账号使用方式','settings.expiryOrder':'按到期时间排序','settings.monthlyPriority':'优先使用月度账号','settings.refreshInterval':'额度刷新间隔','settings.staleAfter':'缓存过期判定','settings.refreshActiveWindow':'活跃刷新窗口','settings.refreshAfterResetDelay':'重置后刷新延迟','settings.refreshRetryDelays':'刷新失败重试间隔','settings.refreshOnStartup':'启动时刷新额度','settings.maxConcurrency':'最大并发刷新','settings.maxInflight':'每个 auth 最大并发占位','settings.maxInflightHelp':'0 表示不限制。一个逻辑请求重试多个 auth 时会保守占用每个已尝试 auth，直到整个请求结束。','settings.sessionAffinityEnabled':'启用插件会话亲和','settings.sessionAffinityTTL':'插件会话亲和 TTL','settings.circuitFailureThreshold':'熔断失败阈值','settings.circuitOpenDuration':'熔断等待时间','settings.circuitHalfOpenSuccessThreshold':'半开恢复成功次数','settings.maxLogEntries':'最大日志条数','settings.logRetention':'日志保留时间',
     'actions.loadData':'加载数据','actions.saveSettings':'保存设置','actions.refreshQuota':'刷新额度','actions.exportConfig':'导出配置','actions.importConfig':'导入配置','actions.refreshLogs':'刷新日志','actions.exportLogs':'导出日志','actions.close':'关闭','actions.saveAccount':'保存账号','actions.cancel':'取消',
     'queue.title':'账号队列','queue.description':'账号卡片按当前调度优先级排序。第一个可用账号就是下一次 Codex 请求会优先选择的账号。','queue.aria':'账号卡片','metrics.nextAccount':'下一账号','metrics.monthlyMode':'Monthly','metrics.lastSelected':'最近选择',
     'logs.title':'调度日志','logs.empty':'暂无日志。发起请求或手动刷新额度后，这里会显示记录。',
@@ -1315,7 +1364,7 @@ let settingsDirty=false;
 let settingsInitialized=!STATUS.shell;
 let statusPollID=0;
 const INLINE_TRANSLATIONS=[
-  ['下一优先','Next preferred'],['可用','Available'],['未知类型','unknown type'],['CPA 优先级','CPA priority'],['插件优先级','Plugin priority'],['熔断：','Circuit: '],['熔断','Circuit'],['全开','closed'],['半开','half-open'],
+  ['下一优先','Next preferred'],['可用','Available'],['并发占位','In-flight slots'],['不限','Unlimited'],['未知类型','unknown type'],['CPA 优先级','CPA priority'],['插件优先级','Plugin priority'],['熔断：','Circuit: '],['熔断','Circuit'],['全开','closed'],['半开','half-open'],
   ['按到期时间','by expiry time'],['优先使用','prefer Monthly'],['已启用','enabled'],['已关闭','disabled'],['暂无数据','No data'],['暂无','None'],['已用完','Used up'],
   ['5 小时额度','5-hour quota'],['周额度','Weekly quota'],['月额度','Monthly quota'],['剩余 ','Remaining '],['5 小时重置：','5-hour reset: '],['长额度重置：','Long quota reset: '],
   ['缓存时间','Cache age'],['熔断计数','Circuit counts'],['失败','Failures'],['成功','Successes'],['主动重置','Reset credits'],['调度状态','Scheduler state'],[' 次',' times'],['累计','total'],['有效期','expires'],
@@ -1373,7 +1422,7 @@ async function refreshStatus(options){const opts=options||{};const data=await re
 function startStatusPolling(){if(statusPollID)return;statusPollID=window.setInterval(()=>refreshStatus({management:true}).catch(()=>{}),15000)}
 async function loadStatus(){try{await refreshStatus({management:true,fillSettings:true});showNotice(t('notice.statusLoaded'),false,'notice.statusLoaded');startStatusPolling()}catch(error){showNotice(error.message||String(error),true)}}
 async function pollStatus(times,delayMs){for(let i=0;i<times;i++){await new Promise((resolve)=>window.setTimeout(resolve,delayMs));await refreshStatus()}}
-function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
+function collectSettingsPayload(){return{handle_enabled:document.getElementById('handleEnabled').checked,enable_usage_feedback:document.getElementById('usageFeedback').checked,enable_reset_probe:document.getElementById('enableResetProbe').checked,probe_on_provisional_roster:document.getElementById('probeOnProvisionalRoster').checked,monthly_mode:document.getElementById('monthlyMode').value,quota_refresh_interval:document.getElementById('refreshInterval').value.trim(),stale_after:document.getElementById('staleAfter').value.trim(),refresh_active_window:document.getElementById('refreshActiveWindow').value.trim(),refresh_after_reset_delay:document.getElementById('refreshAfterResetDelay').value.trim(),refresh_retry_delays:document.getElementById('refreshRetryDelays').value.trim(),refresh_on_startup:document.getElementById('refreshOnStartup').checked,max_refresh_concurrency:Number.parseInt(document.getElementById('maxConcurrency').value,10)||1,max_inflight_requests_per_auth:Number.parseInt(document.getElementById('maxInflight').value,10)||0,session_affinity_enabled:document.getElementById('sessionAffinityEnabled').checked,session_affinity_ttl:document.getElementById('sessionAffinityTTL').value.trim(),circuit_failure_threshold:Number.parseInt(document.getElementById('circuitFailureThreshold').value,10)||5,circuit_open_duration:document.getElementById('circuitOpenDuration').value.trim(),circuit_half_open_success_threshold:Number.parseInt(document.getElementById('circuitHalfOpenSuccessThreshold').value,10)||2,max_log_entries:Number.parseInt(document.getElementById('maxLogEntries').value,10)||200,log_retention:document.getElementById('logRetention').value.trim()}}
 function node(tag,className,text){const item=document.createElement(tag);if(className)item.className=className;if(text!==undefined)item.textContent=text;return item}
 function addKV(parent,key,value){parent.append(node('span','',key),node('span','',value||'暂无'))}
 function addBadge(text,className){return node('span','badge '+(className||''),text)}
@@ -1383,12 +1432,12 @@ function dateLocale(){return currentLocale==='en'?'en-US':'zh-CN'}
 function resetCreditCount(value){if(currentLocale!=='en')return value+' 次';return value+' '+(Number(value)===1?'time':'times')}
 function resetCreditSummary(account){const parts=[];if(account.reset_credits_available_count==null){parts.push(currentLocale==='en'?'None':'暂无')}else{parts.push(resetCreditCount(account.reset_credits_available_count))}if(account.reset_credits_total_earned_count!=null)parts.push(currentLocale==='en'?'/ total '+resetCreditCount(account.reset_credits_total_earned_count):'/ 累计 '+resetCreditCount(account.reset_credits_total_earned_count));for(const credit of account.reset_credits||[]){const raw=credit.expires_at||'';if(!raw)continue;const date=new Date(raw);const expiry=Number.isNaN(date.getTime())?raw:date.toLocaleString(dateLocale(),{hour12:false});const prefix=currentLocale==='en'?'; ':'；';const expires=currentLocale==='en'?'expires ':'有效期 ';parts.push(prefix+(credit.status?credit.status+' ':'')+expires+expiry)}return parts.join(' ')}
 function renderEmptyState(){const empty=STATUS.empty_state||{};const title=empty.title||'暂无账号数据';const message=empty.message||'等待额度刷新后，这里会显示账号卡片。';const box=node('div','empty','');box.append(node('strong','',title),node('div','',message));return box}
-function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
+function renderAccounts(accounts){const queue=document.querySelector('section.queue');if(!queue)return;queue.replaceChildren();const items=Array.isArray(accounts)?accounts:[];if(items.length===0){queue.append(renderEmptyState());return}for(const account of items){const card=node('article','card '+(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id?'next':''));card.dataset.authId=account.auth_id||'';const top=node('div','cardTop');const identity=node('div','identity');const titleLine=node('div','titleLine');titleLine.append(node('span','title',account.alias||account.auth_id||''));if(account.group)titleLine.append(node('span','groupPill',account.group));identity.append(titleLine);const sub=node('div','sub');const code=document.createElement('code');code.textContent=account.auth_id||'';sub.append(code);identity.append(sub);if(account.tags&&account.tags.length){const tags=node('div','metaLine');for(const tag of account.tags)tags.append(node('span','chip',tag));identity.append(tags)}top.append(identity,node('span','rank','#'+(account.rank||'')));card.append(top);const badges=node('div','badges');if(STATUS.next_auth_id&&STATUS.next_auth_id===account.auth_id)badges.append(addBadge('下一优先','next'));badges.append(account.available?addBadge('可用','ok'):addBadge(labelUnavailableReason(account.unavailable_reason),'no'));badges.append(addBadge(account.family||'未知类型'),addBadge('CPA 优先级 '+(account.cpa_priority||0)),addBadge('插件优先级 '+(account.scheduler_priority||0)),addBadge('并发占位 '+(account.inflight_requests||0)+' / '+((account.max_inflight_requests||0)>0?account.max_inflight_requests:'不限'),account.capacity_full?'no':''),addBadge('熔断：'+((account.circuit&&account.circuit.label)||'')));if(account.auth_failure)badges.append(addBadge('请重新登录','no'));if(account.refresh_due_reason)badges.append(addBadge(labelDueReason(account.refresh_due_reason)));card.append(badges);const quotaList=node('div','quotaList');if(account.five_hour&&!account.five_hour.missing)quotaList.append(addQuota(account.five_hour,'5 小时额度'));if(account.long_window)quotaList.append(addQuota(account.long_window,account.long_window.label||'长额度'));card.append(quotaList);const kv=node('div','kv');addKV(kv,'缓存时间',account.cache_age||'暂无');addKV(kv,'熔断计数','失败 '+((account.circuit&&account.circuit.failure_count)||0)+' / 成功 '+((account.circuit&&account.circuit.success_count)||0));addKV(kv,'主动重置',resetCreditSummary(account));if(account.status_note)addKV(kv,'调度状态',account.status_note);if(account.last_error)addKV(kv,'最后错误',account.last_error);if(account.next_retry_text)addKV(kv,'下次重试',account.next_retry_text);card.append(kv);if(account.notes||account.group_notes){const notes=node('div','noteBlock');if(account.notes)notes.append(node('div','',account.notes));if(account.group_notes)notes.append(node('div','',account.group_notes));card.append(notes)}const actions=node('div','cardActions');const refresh=node('button','ghost refreshOne','刷新额度');refresh.type='button';refresh.addEventListener('click',()=>refreshOneQuota(account.auth_id||''));const edit=node('button','secondary openEdit','编辑');edit.type='button';edit.addEventListener('click',()=>openEdit(account.auth_id||''));actions.append(refresh,edit);card.append(actions);queue.append(card)}formatLocalTimes()}
 
 async function readJSON(resp){const text=await resp.text();if(!text)return{};try{return JSON.parse(text)}catch{return{error:text}}}
 function authHeaders(){const input=document.getElementById('managementKey');const key=(input&&input.value||'').trim();if(!key)throw new Error(t('error.managementKeyRequired'));const name='Author'+'ization';const scheme='Bea'+'rer ';const headers={};headers[name]=key.toLowerCase().startsWith(scheme.toLowerCase())?key:scheme+key;return headers}
 async function requestManagement(path,options){const opts=options||{};const headers=authHeaders();let url=MANAGEMENT_BASE+path;if(opts.query){const params=new URLSearchParams(opts.query);url+='?'+params.toString()}const init={method:opts.method||'GET',headers};if(Object.prototype.hasOwnProperty.call(opts,'body')){headers['Content-Type']=opts.contentType||'application/json';init.body=typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)}const resp=await fetch(url,init);const data=await readJSON(resp);if(!resp.ok)throw new Error(data.error||data.message||t('error.requestFailed',{status:resp.status}));return data}
-function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
+function fillSettings(){const s=STATUS.settings||{};document.getElementById('handleEnabled').checked=s.handle_enabled!==false;document.getElementById('usageFeedback').checked=s.enable_usage_feedback!==false;document.getElementById('enableResetProbe').checked=s.enable_reset_probe===true;document.getElementById('probeOnProvisionalRoster').checked=s.probe_on_provisional_roster===true;document.getElementById('monthlyMode').value=s.monthly_mode||'expiry_order';document.getElementById('refreshInterval').value=s.quota_refresh_interval||'30m0s';document.getElementById('staleAfter').value=s.stale_after||'5h0m0s';document.getElementById('refreshActiveWindow').value=s.refresh_active_window||'1h0m0s';document.getElementById('refreshAfterResetDelay').value=s.refresh_after_reset_delay||'1m0s';document.getElementById('refreshRetryDelays').value=s.refresh_retry_delays||'1m0s,5m0s,15m0s';document.getElementById('refreshOnStartup').checked=s.refresh_on_startup===true;document.getElementById('maxConcurrency').value=s.max_refresh_concurrency||1;document.getElementById('maxInflight').value=s.max_inflight_requests_per_auth||0;document.getElementById('sessionAffinityEnabled').checked=s.session_affinity_enabled===true;document.getElementById('sessionAffinityTTL').value=s.session_affinity_ttl||'1h0m0s';document.getElementById('circuitFailureThreshold').value=s.circuit_failure_threshold||5;document.getElementById('circuitOpenDuration').value=s.circuit_open_duration||'30m0s';document.getElementById('circuitHalfOpenSuccessThreshold').value=s.circuit_half_open_success_threshold||2;document.getElementById('maxLogEntries').value=s.max_log_entries||200;document.getElementById('logRetention').value=s.log_retention||'24h0m0s'}
 async function saveSettings(){try{if(!statusLoaded){await loadStatus();return}await requestManagement('/settings',{method:'PUT',body:collectSettingsPayload()});settingsDirty=false;showNotice(t('notice.settingsSaved'),false,'notice.settingsSaved');await refreshStatus({management:true,fillSettings:true})}catch(error){showNotice(error.message||String(error),true)}}
 async function refreshQuota(){try{await requestManagement('/refresh',{method:'POST'});showNotice(t('notice.refreshRequested'),false,'notice.refreshRequested');await refreshStatus({management:true});pollStatus(3,1200)}catch(error){showNotice(error.message||String(error),true)}}
 function splitTags(text){return text.split(',').map((item)=>item.trim()).filter(Boolean)}

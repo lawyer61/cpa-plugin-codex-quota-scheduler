@@ -6,6 +6,8 @@
 账号提供额度感知的优化版 Fill First 调度，让 CPA 按账号的真实可用性选择账号，
 而不只是依赖固定的账号顺序。
 
+请求生命周期并发功能要求 CPA v7.2.152。
+
 ## v0.2.1 主要更新
 
 - 已有安装会安全迁移延迟重置基线；全新安装会先观察首个确认的延迟重置窗口，再执行激活。
@@ -210,6 +212,9 @@ enable_usage_feedback: true
 enable_reset_probe: false
 probe_on_provisional_roster: false
 max_refresh_concurrency: 1
+max_inflight_requests_per_auth: 0
+session_affinity_enabled: false
+session_affinity_ttl: 1h
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5
 circuit_open_duration: 30m
@@ -222,6 +227,14 @@ log_retention: 24h
 
 - `expiry_order`：周度账号和月度账号共同按到期时间排序。
 - `priority`：在同一个可选择类别和插件优先级中，月度账号排在周度账号前面。
+
+`max_inflight_requests_per_auth` 限制每个认证实例的保守逻辑请求占位数，`0`
+表示不限制。一个逻辑请求从 auth A 重试到 auth B 时，A、B 都会保留占位，直到
+CPA 发出 `request.complete`。可选的插件会话亲和使用独立缓存；已绑定 auth 满载时，
+会切换到下一个合法候选。本功能的生命周期接入基于并测试于 CPA v7.2.152；更旧的
+CPA 版本不支持这项功能。全部合法 auth 都满载时，插件会拒绝本次 scheduler
+pick；CPA v7.2.152 会把这个普通调度错误映射为 HTTP 500，而不是退回不受限的
+内置 selector。
 
 `quota_endpoint` 被限制为预期的 ChatGPT 额度端点，不能改为任意主机。
 

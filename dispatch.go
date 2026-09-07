@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -17,6 +19,7 @@ var (
 	currentConfig          atomic.Value
 	globalState            = NewPluginState(DefaultConfig())
 	globalTrials           = NewTrialRegistry()
+	globalInFlightTracker  = NewInFlightTracker()
 	globalEvidenceIntents  = make(chan EvidenceIntent, 64)
 	evidenceConsumerOnce   sync.Once
 	refresherMu            sync.Mutex
@@ -49,6 +52,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(PluginRegistration())
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleRequestInterceptBefore(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleRequestInterceptAfter(request)
+	case pluginabi.MethodRequestComplete:
+		return handleRequestComplete(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsageHandle(request)
 	case pluginabi.MethodManagementRegister:
@@ -79,6 +88,7 @@ func configure(raw []byte) error {
 	}
 	currentConfig.Store(cfg)
 	globalState.ReplaceConfig(cfg)
+	globalInFlightTracker.ConfigureAffinity(cfg.SessionAffinityEnabled, cfg.SessionAffinityTTL)
 	globalState.SetAnnotations(AnnotationState{Accounts: disk.Accounts, Groups: disk.Groups})
 	startEvidenceConsumer()
 	publishSchedulerState(globalState, nil, time.Now())
@@ -113,6 +123,9 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		}
 	}
 	decision := schedulerPickPublished(req, time.Now())
+	if decision.Err != nil {
+		return nil, decision.Err
+	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{
 		AuthID:          decision.AuthID,
 		DelegateBuiltin: decision.DelegateBuiltin,
@@ -122,6 +135,100 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 
 func schedulerPickSnapshot(req pluginapi.SchedulerPickRequest, snapshot StateSnapshot, now time.Time) PickDecision {
 	return PickCodexAccount(req, snapshot, now)
+}
+
+const inFlightRequestHeader = "X-Codex-Quota-Scheduler-Request-Id"
+
+func requestTrackingEnabled(cfg Config) bool {
+	return cfg.MaxInflightRequestsPerAuth > 0 || cfg.SessionAffinityEnabled
+}
+
+func handleRequestInterceptBefore(raw []byte) ([]byte, error) {
+	var req pluginapi.RequestInterceptRequest
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	return okEnvelope(interceptRequestBefore(globalInFlightTracker, globalState.Config(), req))
+}
+
+func interceptRequestBefore(tracker *InFlightTracker, cfg Config, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+	resp := pluginapi.RequestInterceptResponse{ClearHeaders: []string{inFlightRequestHeader}}
+	if !requestTrackingEnabled(cfg) {
+		return resp
+	}
+	requestID := strings.TrimSpace(req.RequestID)
+	if requestID == "" {
+		resp.Terminate = true
+		resp.StatusCode = http.StatusInternalServerError
+		resp.ResponseHeaders = http.Header{"Content-Type": []string{"application/json"}}
+		resp.ResponseBody = []byte(`{"error":"request correlation is unavailable"}`)
+		return resp
+	}
+	sessionID := ""
+	if cfg.SessionAffinityEnabled {
+		sessionID = cliproxyauth.CanonicalSessionID(req.Headers, req.Body, req.Metadata)
+	}
+	if tracker == nil || !tracker.Begin(requestID, sessionID) {
+		resp.Terminate = true
+		resp.StatusCode = http.StatusConflict
+		resp.ResponseHeaders = http.Header{"Content-Type": []string{"application/json"}}
+		resp.ResponseBody = []byte(`{"error":"request correlation is no longer active"}`)
+		return resp
+	}
+	resp.Headers = http.Header{inFlightRequestHeader: []string{requestID}}
+	return resp
+}
+
+func handleRequestInterceptAfter(raw []byte) ([]byte, error) {
+	var req pluginapi.RequestInterceptRequest
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+	}
+	return okEnvelope(interceptRequestAfter(globalInFlightTracker, req))
+}
+
+func interceptRequestAfter(tracker *InFlightTracker, req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+	resp := pluginapi.RequestInterceptResponse{ClearHeaders: []string{inFlightRequestHeader}}
+	requestID := strings.TrimSpace(req.RequestID)
+	if tracker == nil || !tracker.HasRequest(requestID) {
+		return resp
+	}
+	if marker := requestHeaderValue(req.Headers, inFlightRequestHeader); marker != requestID {
+		resp.Terminate = true
+		resp.StatusCode = http.StatusInternalServerError
+		resp.ResponseHeaders = http.Header{"Content-Type": []string{"application/json"}}
+		resp.ResponseBody = []byte(`{"error":"request correlation marker is missing or invalid"}`)
+	}
+	return resp
+}
+
+func handleRequestComplete(raw []byte) ([]byte, error) {
+	var completion pluginapi.RequestCompletion
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &completion); err != nil {
+			return nil, err
+		}
+	}
+	globalInFlightTracker.Complete(completion.RequestID)
+	return okEnvelope(struct{}{})
+}
+
+func requestHeaderValue(headers http.Header, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest, decision PickDecision, now time.Time) {
@@ -147,6 +254,11 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 			fields["selected_cpa_priority"] = selected.CPAPriority
 			fields["selected_scheduler_priority"] = selected.SchedulerPriority
 		}
+	} else if decision.Err != nil {
+		level = "warn"
+		event = "scheduler.rejected"
+		message = "插件拒绝本次调度"
+		fields["error"] = decision.Err.Error()
 	} else if decision.DelegateBuiltin != "" {
 		event = "scheduler.fallback"
 		message = "插件触发内置调度 fallback"
