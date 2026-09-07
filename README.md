@@ -277,6 +277,9 @@ The page provides:
 - quota refresh, log viewing/export, and configuration import/export; and
 - English and Chinese interface switching.
 
+The CPA plugin menu API accepts only one static label, so the registered
+sidebar name is **Codex Scheduler** in every management UI language.
+
 When embedded in CPA Management Center, the plugin initially follows CPA's
 current language: Chinese locales use Chinese, while every other locale defaults
 to English. A language explicitly selected inside the plugin is remembered and

@@ -227,7 +227,7 @@ log_retention: 24h
 
 ## 管理界面
 
-从 CPA Management Center 打开 **Codex 调度器**，或者访问：
+从 CPA Management Center 打开 **Codex Scheduler**，或者访问：
 
 ```text
 /v0/resource/plugins/codex-quota-scheduler/status
@@ -242,6 +242,9 @@ log_retention: 24h
 - 别名、备注、标签、分组和单账号插件优先级编辑；
 - 额度刷新、日志查看/导出以及配置导入/导出；
 - 中英文界面切换。
+
+CPA 插件菜单 API 只能注册一个静态名称，因此所有管理界面的侧边栏统一显示
+**Codex Scheduler**。
 
 嵌入 CPA Management Center 时，插件初次会跟随 CPA 当前语言：中文 locale 使用
 中文，其余 locale 默认使用英文。如果曾在插件内手动选择语言，该选择会被记住，
