@@ -12,8 +12,10 @@ import (
 const completedRequestTombstoneLimit = 4096
 
 var (
-	ErrInflightCapacity   = errors.New("all eligible codex auths are at max inflight capacity")
-	ErrRequestCorrelation = errors.New("request correlation is unavailable")
+	ErrAuthInstanceUnavailable = errors.New("auth instance identity is unavailable")
+	ErrInflightConfiguration   = errors.New("max inflight requests per auth must not be negative")
+	ErrInflightCapacity        = errors.New("all eligible codex auths are at max inflight capacity")
+	ErrRequestCorrelation      = errors.New("request correlation is unavailable")
 )
 
 // InFlightSnapshot is a point-in-time view of logical request reservations.
@@ -79,10 +81,17 @@ func (t *InFlightTracker) Begin(requestID, sessionID string) bool {
 }
 
 // TryAcquire atomically checks and reserves one slot. limit == 0 is unlimited.
-// The same logical request reusing the same auth instance is idempotent.
-func (t *InFlightTracker) TryAcquire(requestID string, instance AuthInstanceID, authID string, limit int) (allowed, added bool) {
-	if t == nil || strings.TrimSpace(requestID) == "" || instance == 0 || strings.TrimSpace(authID) == "" || limit < 0 {
-		return false, false
+// It returns whether a new slot was added; reuse by the same request is idempotent.
+// Only an actual limit hit returns ErrInflightCapacity.
+func (t *InFlightTracker) TryAcquire(requestID string, instance AuthInstanceID, authID string, limit int) (added bool, err error) {
+	if t == nil || strings.TrimSpace(requestID) == "" {
+		return false, ErrRequestCorrelation
+	}
+	if instance == 0 || strings.TrimSpace(authID) == "" {
+		return false, ErrAuthInstanceUnavailable
+	}
+	if limit < 0 {
+		return false, ErrInflightConfiguration
 	}
 	requestID = strings.TrimSpace(requestID)
 	authID = strings.TrimSpace(authID)
@@ -90,17 +99,17 @@ func (t *InFlightTracker) TryAcquire(requestID string, instance AuthInstanceID, 
 	defer t.mu.Unlock()
 	request := t.requests[requestID]
 	if request == nil {
-		return false, false
+		return false, ErrRequestCorrelation
 	}
 	if _, held := request.reservations[instance]; held {
-		return true, false
+		return false, nil
 	}
 	if limit > 0 && t.counts[instance] >= limit {
-		return false, false
+		return false, ErrInflightCapacity
 	}
 	request.reservations[instance] = authID
 	t.counts[instance]++
-	return true, true
+	return true, nil
 }
 
 // ReserveSynthetic reserves capacity for a plugin-owned request whose exact
@@ -109,10 +118,10 @@ func (t *InFlightTracker) ReserveSynthetic(requestID string, instance AuthInstan
 	if t == nil || !t.Begin(requestID, "") {
 		return nil, ErrRequestCorrelation
 	}
-	allowed, _ := t.TryAcquire(requestID, instance, authID, limit)
-	if !allowed {
+	_, err := t.TryAcquire(requestID, instance, authID, limit)
+	if err != nil {
 		t.Complete(requestID)
-		return nil, ErrInflightCapacity
+		return nil, err
 	}
 	var once sync.Once
 	return func() { once.Do(func() { t.Complete(requestID) }) }, nil

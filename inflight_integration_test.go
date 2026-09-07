@@ -204,7 +204,7 @@ func TestRequestCompleteABIDispatchReleasesEveryTerminalOutcome(t *testing.T) {
 	for i, outcome := range outcomes {
 		requestID := "complete-" + string(rune('a'+i))
 		tracker.Begin(requestID, "")
-		if allowed, _ := tracker.TryAcquire(requestID, 1, "auth-a", 10); !allowed {
+		if _, err := tracker.TryAcquire(requestID, 1, "auth-a", 10); err != nil {
 			t.Fatalf("acquire %s failed", requestID)
 		}
 		raw, _ := json.Marshal(pluginapi.RequestCompletion{RequestID: requestID, Outcome: outcome})
@@ -223,7 +223,7 @@ func TestManagementStatusShowsInflightCapacity(t *testing.T) {
 	globalInFlightTracker = tracker
 	t.Cleanup(func() { globalInFlightTracker = previous })
 	tracker.Begin("status-request", "")
-	if allowed, _ := tracker.TryAcquire("status-request", 1, "auth-a", 1); !allowed {
+	if _, err := tracker.TryAcquire("status-request", 1, "auth-a", 1); err != nil {
 		t.Fatal("status reservation failed")
 	}
 	cfg := DefaultConfig()

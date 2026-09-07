@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -13,17 +14,17 @@ func TestInFlightTrackerReservationLifecycle(t *testing.T) {
 	if !tracker.Begin("request-1", "session-1") {
 		t.Fatal("Begin(request-1) = false")
 	}
-	if allowed, added := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); !allowed || !added {
-		t.Fatalf("first A acquire = %v,%v", allowed, added)
+	if added, err := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); err != nil || !added {
+		t.Fatalf("first A acquire = %v,%v", err, added)
 	}
-	if allowed, added := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); !allowed || added {
-		t.Fatalf("duplicate A acquire = %v,%v", allowed, added)
+	if added, err := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); err != nil || added {
+		t.Fatalf("duplicate A acquire = %v,%v", err, added)
 	}
-	if allowed, added := tracker.TryAcquire("request-1", instanceB, "auth-b", 1); !allowed || !added {
-		t.Fatalf("B acquire = %v,%v", allowed, added)
+	if added, err := tracker.TryAcquire("request-1", instanceB, "auth-b", 1); err != nil || !added {
+		t.Fatalf("B acquire = %v,%v", err, added)
 	}
-	if allowed, added := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); !allowed || added {
-		t.Fatalf("A retry acquire = %v,%v", allowed, added)
+	if added, err := tracker.TryAcquire("request-1", instanceA, "auth-a", 1); err != nil || added {
+		t.Fatalf("A retry acquire = %v,%v", err, added)
 	}
 	if got := tracker.Count(instanceA); got != 1 {
 		t.Fatalf("A count = %d, want 1", got)
@@ -62,8 +63,8 @@ func TestInFlightTrackerConcurrentCapacity(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			allowed, added := tracker.TryAcquire(requestID, instance, "auth-a", 1)
-			if allowed && added {
+			added, err := tracker.TryAcquire(requestID, instance, "auth-a", 1)
+			if err == nil && added {
 				winnersMu.Lock()
 				winners++
 				winnersMu.Unlock()
@@ -84,8 +85,8 @@ func TestInFlightTrackerRollbackOnlyRemovesUnsentReservation(t *testing.T) {
 	tracker := NewInFlightTracker()
 	instance := AuthInstanceID(1)
 	tracker.Begin("request-1", "")
-	if allowed, added := tracker.TryAcquire("request-1", instance, "auth-a", 1); !allowed || !added {
-		t.Fatalf("acquire = %v,%v", allowed, added)
+	if added, err := tracker.TryAcquire("request-1", instance, "auth-a", 1); err != nil || !added {
+		t.Fatalf("acquire = %v,%v", err, added)
 	}
 	if !tracker.Rollback("request-1", instance) {
 		t.Fatal("Rollback = false")
@@ -94,7 +95,7 @@ func TestInFlightTrackerRollbackOnlyRemovesUnsentReservation(t *testing.T) {
 		t.Fatal("duplicate Rollback = true")
 	}
 	tracker.Begin("request-2", "")
-	if allowed, _ := tracker.TryAcquire("request-2", instance, "auth-a", 1); !allowed {
+	if _, err := tracker.TryAcquire("request-2", instance, "auth-a", 1); err != nil {
 		t.Fatal("capacity was not returned after rollback")
 	}
 }
@@ -116,7 +117,7 @@ func TestInFlightTrackerAffinityReconfigurePreservesReservations(t *testing.T) {
 	if got, ok := tracker.BoundAuth(key); !ok || got != "auth-a" {
 		t.Fatalf("BoundAuth = %q,%v", got, ok)
 	}
-	if allowed, _ := tracker.TryAcquire("request-1", instance, "auth-a", 1); !allowed {
+	if _, err := tracker.TryAcquire("request-1", instance, "auth-a", 1); err != nil {
 		t.Fatal("reservation acquire failed")
 	}
 	tracker.ConfigureAffinity(false, 2*time.Hour)
@@ -129,5 +130,38 @@ func TestInFlightTrackerAffinityReconfigurePreservesReservations(t *testing.T) {
 	tracker.ConfigureAffinity(true, 2*time.Hour)
 	if _, ok := tracker.BoundAuth(key); ok {
 		t.Fatal("old binding survived cache replacement")
+	}
+}
+
+func TestInFlightTrackerAcquisitionErrorsAreNotCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requestID string
+		instance  AuthInstanceID
+		authID    string
+		limit     int
+		want      error
+	}{
+		{"empty request", "", 1, "a", 4, ErrRequestCorrelation},
+		{"unknown request", "missing", 1, "a", 4, ErrRequestCorrelation},
+		{"zero instance", "request", 0, "a", 4, ErrAuthInstanceUnavailable},
+		{"empty auth", "request", 1, "", 4, ErrAuthInstanceUnavailable},
+		{"negative limit", "request", 1, "a", -1, ErrInflightConfiguration},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := NewInFlightTracker()
+			tracker.Begin("request", "")
+			added, err := tracker.TryAcquire(tc.requestID, tc.instance, tc.authID, tc.limit)
+			if added || !errors.Is(err, tc.want) || tracker.Snapshot().Total != 0 {
+				t.Fatalf("acquisition = added %v, error %v; want %v and no reservation", added, err, tc.want)
+			}
+		})
+	}
+	tracker := NewInFlightTracker()
+	if _, err := tracker.ReserveSynthetic("probe", 0, "a", 4); !errors.Is(err, ErrAuthInstanceUnavailable) {
+		t.Fatalf("synthetic invalid identity = %v", err)
+	}
+	if tracker.Snapshot().ActiveRequests != 0 {
+		t.Fatal("failed synthetic request remained active")
 	}
 }

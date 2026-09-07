@@ -5,10 +5,13 @@
 - The limit counts conservative logical-request reservations per auth instance. One request may reserve A and B across retries, and releases all held reservations only at logical completion.
 - Session affinity is plugin-private, disabled by default, and configured independently from CPA routing affinity. It reuses v7.2.152 session identity and cache behavior, but commits a binding only after capacity admission succeeds.
 - A full bound auth may switch to the next eligible auth inside `scheduler.pick`. When every eligible auth is full, the scheduler returns an error instead of delegating to an unlimited built-in selector.
+- Quota refresh carries the coordinator's registered auth instance into account state, including merges with older zero-instance entries. Pick does not invent a new identity or reset reservation counts.
 - State remains in process memory. No database, Redis, distributed lock, persistent lease, executor rewrite, or host patch was added.
 - PRs #4 through #10 were merged before feature work. Conflict resolution preserves the opt-in management-key storage, quota-pressure ordering, reset-window activation, reset countdowns, localization, English sidebar name, and quota-bar coloring.
 
 ## Modules
+- `refresh.go`: carries the registered auth instance through quota refresh and account-state merges.
+- `inflight_production_test.go`: exercises authoritative roster publication, quota refresh, request interception, scheduler ABI, and completion without hand-populating scheduler identities.
 - `inflight.go`: logical request ledger, atomic per-auth admission, bounded completion tombstones, synthetic probe reservations, and plugin-private affinity cache.
 - `dispatch.go`: v7.2.152 request interceptor/lifecycle ABI handlers and protected RequestID header bridge.
 - `scheduler_snapshot.go` / `selection.go`: affinity-aware selection, full-auth skipping, atomic reservation, conservative retry behavior, and all-full rejection.
@@ -19,7 +22,8 @@
 
 ## How to run
 ```bash
-export PATH=/opt/go1.26.0/bin:$PATH
+# Go 1.26+ and a CGO C compiler must be on PATH.
+go version
 make test
 go test -race ./...
 go vet ./...
@@ -35,6 +39,8 @@ go run ./scripts/refactor_gates/analyze_pick_path.go -root . -entry handleSchedu
 - Added idempotent per-request/per-auth reservations, multi-auth conservative retry accounting, and release for succeeded, failed, rejected, and canceled completions.
 - Added bound-auth failover, all-full rejection without builtin fallback, UI status, settings persistence/import/export, and live reconfiguration without clearing existing reservations.
 - Added capacity admission for reset-window activation requests.
+- Fixed false capacity rejection on the first request: refreshed account state previously had instance `0` even when the runtime binding was valid.
+- Distinguishes actual capacity exhaustion from missing auth identity, missing/completed request correlation, and invalid limit configuration. All error paths still block built-in fallback.
 
 ## Not implemented / known limitations
 - Reservations are local to one active plugin instance; there is no cross-process or distributed limit.
@@ -45,6 +51,8 @@ go run ./scripts/refactor_gates/analyze_pick_path.go -root . -entry handleSchedu
 - Enabling the feature while requests are already past BeforeAuth cannot reconstruct those earlier in-flight requests; subsequent correlated requests are limited normally.
 
 ## Observed results
+- Reproduced the first-request failure on `fcf96db` with an empty reservation ledger, a valid runtime binding, and `AccountState.Instance == 0`. Changing only the scheduler identity in a temporary test probe made it pass; the probe was then removed. Earlier tests had supplied nonzero identities manually and missed this production conversion.
+- The production-path regression now passes with affinity both on and off: four reservations allowed, fifth denied, full-auth failover, identity preserved across refresh, completion/duplicate completion release, and repair of cached zero-instance entries.
 - `make test`: passed.
 - `go test -race ./...`: passed.
 - `go vet ./...`: passed.
@@ -56,4 +64,4 @@ go run ./scripts/refactor_gates/analyze_pick_path.go -root . -entry handleSchedu
 ## Other things that user need to note
 - Development and validation were performed in the private CNB workspace branch `codex/integrate-open-prs-and-inflight-limit`.
 - The optional browser management-key persistence from PR #4 remains disabled by default and stores plaintext only when the user explicitly enables it on a trusted browser.
-- No release or tag was created.
+- Panel distribution metadata is maintained separately on the `cpa-store` branch; this fix does not modify that branch or the existing `v0.2.1-pr12.1` release.

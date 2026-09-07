@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -87,8 +88,8 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 		if boundAuthID, ok := snapshot.InFlight.BoundAuth(affinityKey); ok {
 			result := selectAccountByAuthID(*snapshot, candidates, boundAuthID, now, snapshot.Trials)
 			if result.AuthID != "" {
-				decision, selected, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
-				if selected {
+				decision, decided, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
+				if decided {
 					return decision
 				}
 				capacityBlocked = full
@@ -104,8 +105,8 @@ func schedulerPickPublished(req pluginapi.SchedulerPickRequest, now time.Time) P
 			}
 			return publishedFallbackDecision(snapshot, req, result, now)
 		}
-		decision, selected, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
-		if selected {
+		decision, decided, full := reservePublishedSelection(snapshot, req, result, requestID, affinityKey, now)
+		if decided {
 			return decision
 		}
 		if full {
@@ -139,9 +140,18 @@ func pickPublishedUntracked(snapshot *SchedulerSnapshot, req pluginapi.Scheduler
 }
 
 func reservePublishedSelection(snapshot *SchedulerSnapshot, req pluginapi.SchedulerPickRequest, result SelectionResult, requestID, affinityKey string, now time.Time) (PickDecision, bool, bool) {
-	allowed, added := snapshot.InFlight.TryAcquire(requestID, result.Instance, result.AuthID, snapshot.MaxInflightRequestsPerAuth)
-	if !allowed {
+	added, err := snapshot.InFlight.TryAcquire(requestID, result.Instance, result.AuthID, snapshot.MaxInflightRequestsPerAuth)
+	if errors.Is(err, ErrInflightCapacity) {
 		return PickDecision{}, false, true
+	}
+	if err != nil {
+		reason := "request_correlation_unavailable"
+		if errors.Is(err, ErrAuthInstanceUnavailable) {
+			reason = "auth_instance_unavailable"
+		} else if errors.Is(err, ErrInflightConfiguration) {
+			reason = "inflight_configuration_invalid"
+		}
+		return observeSchedulerDecision(snapshot, req, PickDecision{Handled: true, Reason: reason, Err: err}, now), true, false
 	}
 	if result.Class == Opportunistic && added && (snapshot.Trials == nil || !snapshot.Trials.TryBegin(result.Instance, now)) {
 		snapshot.InFlight.Rollback(requestID, result.Instance)

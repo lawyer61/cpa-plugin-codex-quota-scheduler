@@ -1691,6 +1691,11 @@ func (r *QuotaRefresher) refreshAuthVersionedHeld(auth pluginapi.HostAuthFileEnt
 		return
 	}
 	account := accountStateFromAuth(auth, r.now())
+	// Keep the coordinator's registered auth identity in the scheduler view.
+	// A zero instance is invalid for both request reservations and trial tracking.
+	if r.txnIntent != nil {
+		account.Instance = r.txnIntent.Instance
+	}
 	account.Priority = priority
 
 	authResp, err := r.getAuthWithAdmissionPermit(account.AuthID, version, auth.AuthIndex)
@@ -2153,6 +2158,9 @@ func (r *QuotaRefresher) mergeExistingAccount(account AccountState) AccountState
 		merged := existing
 		merged.AuthID = account.AuthID
 		merged.AuthIndex = account.AuthIndex
+		if account.Instance != 0 {
+			merged.Instance = account.Instance
+		}
 		merged.DisplayName = account.DisplayName
 		merged.Email = account.Email
 		merged.Provider = account.Provider
