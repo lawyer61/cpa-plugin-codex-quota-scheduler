@@ -277,6 +277,11 @@ The page provides:
 - quota refresh, log viewing/export, and configuration import/export; and
 - English and Chinese interface switching.
 
+When embedded in CPA Management Center, the plugin initially follows CPA's
+current language: Chinese locales use Chinese, while every other locale defaults
+to English. A language explicitly selected inside the plugin is remembered and
+takes precedence on later visits.
+
 Protected data and actions require the CPA Management key. By default, the key
 remains only in the current browser page session. The optional **Remember
 management key in this browser** setting saves it unencrypted in browser local
